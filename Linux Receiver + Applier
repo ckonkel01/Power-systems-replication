@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+# ibmi_journal_receiver.py
+# Receives IBM i journal entries and applies them to a target store.
+# Target can be: PostgreSQL, SQLite, flat files, or another IBM i (via DDM).
+
+import socket
+import struct
+import threading
+import sqlite3
+import logging
+import time
+import signal
+import sys
+from dataclasses import dataclass
+from queue import Queue, Empty
+from pathlib import Path
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(message)s'
+)
+log = logging.getLogger(__name__)
+
+MAGIC         = 0x49424D49   # "IBMI"
+LISTEN_PORT   = 9100
+WIRE_HDR_FMT  = '!IIQIIcc10s10s10s26sQII'   # matches WireEntry in C
+WIRE_HDR_SIZE = struct.calcsize(WIRE_HDR_FMT)
+
+# IBM i journal entry type codes (partial — extend as needed)
+ENTRY_TYPES = {
+    b'PT': 'WRITE_AFTER',       # Put (write after image)
+    b'PX': 'WRITE_BEFORE',      # Put (write before image)
+    b'UP': 'UPDATE_AFTER',      # Update after
+    b'UB': 'UPDATE_BEFORE',     # Update before
+    b'DL': 'DELETE',            # Delete
+    b'DR': 'DELETE_ROLLBACK',
+    b'CT': 'COMMIT',
+    b'RB': 'ROLLBACK',
+    b'RF': 'RECV_ATTACHED',     # New receiver attached
+    b'JI': 'JRN_IMAGE',         # Journal entry image
+    b'OP': 'OPEN',
+    b'CL': 'CLOSE',
+}
+
+@dataclass
+class JournalEntry:
+    sequence_number: int
+    entry_type: str
+    entry_code: str
+    library: str
+    file: str
+    member: str
+    job_name: str
+    timestamp: int
+    data: bytes
+
+
+def recv_exact(sock, n):
+    buf = b''
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("Connection closed")
+        buf += chunk
+    return buf
+
+
+def parse_wire_entry(sock):
+    hdr_bytes = recv_exact(sock, WIRE_HDR_SIZE)
+    (magic, entry_len, seq, etype, ecode,
+     flag, _unused,
+     library, file_, member, job_name,
+     timestamp, data_offset, data_length) = struct.unpack(WIRE_HDR_FMT, hdr_bytes)
+
+    if magic != MAGIC:
+        raise ValueError(f"Bad magic: 0x{magic:08X}")
+
+    data = b''
+    if data_length > 0:
+        data = recv_exact(sock, data_length)
+
+    entry_type_code = bytes([
+        (etype >> 8) & 0xFF,
+        etype & 0xFF
+    ])
+    entry_type = ENTRY_TYPES.get(entry_type_code,
+                                  f'UNKNOWN_{entry_type_code.hex()}')
+
+    return JournalEntry(
+        sequence_number = seq,
+        entry_type      = entry_type,
+        entry_code      = chr(ecode & 0xFF),
+        library         = library.rstrip(b' \x00').decode('ascii', errors='replace'),
+        file            = file_.rstrip(b' \x00').decode('ascii', errors='replace'),
+        member          = member.rstrip(b' \x00').decode('ascii', errors='replace'),
+        job_name        = job_name.rstrip(b' \x00').decode('ascii', errors='replace'),
+        timestamp       = timestamp,
+        data            = data,
+    )
+
+
+class JournalApplier:
+    """Applies journal entries to a SQLite database.
+    Swap this out for PostgreSQL, Kafka, etc. as needed.
+    """
+
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self.conn    = sqlite3.connect(db_path, check_same_thread=False)
+        self.lock    = threading.Lock()
+        self._setup_meta_tables()
+
+    def _setup_meta_tables(self):
+        with self.lock:
+            self.conn.execute('''
+                CREATE TABLE IF NOT EXISTS _repl_log (
+                    seq          INTEGER PRIMARY KEY,
+                    entry_type   TEXT,
+                    library      TEXT,
+                    file         TEXT,
+                    member       TEXT,
+                    job_name     TEXT,
+                    applied_at   REAL,
+                    data_len     INTEGER
+                )
+            ''')
+            self.conn.execute('''
+                CREATE TABLE IF NOT EXISTS _repl_checkpoint (
+                    id      INTEGER PRIMARY KEY CHECK (id = 1),
+                    last_seq INTEGER NOT NULL
+                )
+            ''')
+            self.conn.commit()
+
+    def get_checkpoint(self):
+        row = self.conn.execute(
+            'SELECT last_seq FROM _repl_checkpoint WHERE id=1'
+        ).fetchone()
+        return row[0] if row else 0
+
+    def save_checkpoint(self, seq):
+        self.conn.execute('''
+            INSERT INTO _repl_checkpoint (id, last_seq) VALUES (1, ?)
+            ON CONFLICT(id) DO UPDATE SET last_seq=excluded.last_seq
+        ''', (seq,))
+
+    def _ensure_table(self, table_name: str, row_data: dict):
+        """Lazily create target table if it doesn't exist."""
+        cols = ', '.join(
+            f'"{k}" TEXT' for k in row_data.keys()
+        )
+        self.conn.execute(
+            f'CREATE TABLE IF NOT EXISTS "{table_name}" ({cols})'
+        )
+
+    def _parse_ibmi_row(self, data: bytes) -> dict:
+        """
+        IBM i row data in journal entries is raw packed record format.
+        Without the file's field definitions (from DSPFFD or QUSLFLD API),
+        you cannot properly parse field boundaries.
+
+        In a real implementation you'd:
+          1. Call QUSLFLD on IBM i to get field definitions at startup
+          2. Cache them keyed by library/file/member
+          3. Use those definitions to split the byte string
+
+        For now: store as hex blob + length. Replace with real parsing.
+        """
+        return {
+            '_raw_hex':    data.hex(),
+            '_raw_length': str(len(data))
+        }
+
+    def apply(self, entry: JournalEntry):
+        table = f"{entry.library}_{entry.file}_{entry.member}"
+
+        with self.lock:
+            try:
+                if entry.entry_type in ('WRITE_AFTER', 'UPDATE_AFTER'):
+                    if entry.data:
+                        row = self._parse_ibmi_row(entry.data)
+                        self._ensure_table(table, row)
+                        cols  = ', '.join(f'"{k}"' for k in row)
+                        vals  = list(row.values())
+                        marks = ', '.join('?' * len(vals))
+                        self.conn.execute(
+                            f'INSERT INTO "{table}" ({cols}) VALUES ({marks})',
+                            vals
+                        )
+
+                elif entry.entry_type == 'DELETE':
+                    # Without PK info we can't do targeted deletes.
+                    # Log it for now.
+                    log.warning("DELETE entry for %s — PK parsing needed", table)
+
+                elif entry.entry_type == 'COMMIT':
+                    self.conn.commit()
+                    return  # Skip repl_log for commits
+
+                elif entry.entry_type == 'ROLLBACK':
+                    self.conn.rollback()
+                    return
+
+                self.conn.execute('''
+                    INSERT OR IGNORE INTO _repl_log
+                    (seq, entry_type, library, file, member, job_name,
+                     applied_at, data_len)
+                    VALUES (?,?,?,?,?,?,?,?)
+                ''', (
+                    entry.sequence_number, entry.entry_type,
+                    entry.library, entry.file, entry.member,
+                    entry.job_name, time.time(), len(entry.data)
+                ))
+
+                self.save_checkpoint(entry.sequence_number)
+
+            except Exception as e:
+                log.error("Apply error seq=%d: %s", entry.sequence_number, e)
+                self.conn.rollback()
+                raise
+
+
+class ReceiverServer:
+    def __init__(self, port: int, applier: JournalApplier):
+        self.port    = port
+        self.applier = applier
+        self.queue   = Queue(maxsize=10000)
+        self._stop   = threading.Event()
+
+    def _handle_client(self, conn, addr):
+        log.info("Connection from %s", addr)
+        try:
+            while not self._stop.is_set():
+                entry = parse_wire_entry(conn)
+                self.queue.put(entry)
+
+                # ACK
+                conn.send(b'\xAC')
+
+        except ConnectionError:
+            log.info("Client %s disconnected", addr)
+        except Exception as e:
+            log.error("Client handler error: %s", e)
+        finally:
+            conn.close()
+
+    def _apply_worker(self):
+        log.info("Apply worker started")
+        while not self._stop.is_set():
+            try:
+                entry = self.queue.get(timeout=1.0)
+                self.applier.apply(entry)
+                self.queue.task_done()
+            except Empty:
+                continue
+            except Exception as e:
+                log.error("Applier error: %s", e)
+
+    def run(self):
+        # Start apply worker thread
+        t = threading.Thread(target=self._apply_worker, daemon=True)
+        t.start()
+
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(('0.0.0.0', self.port))
+        srv.listen(8)
+        srv.settimeout(1.0)
+
+        log.info("Listening on port %d", self.port)
+
+        while not self._stop.is_set():
+            try:
+                conn, addr = srv.accept()
+                ct = threading.Thread(
+                    target=self._handle_client,
+                    args=(conn, addr),
+                    daemon=True
+                )
+                ct.start()
+            except socket.timeout:
+                continue
+
+        srv.close()
+
+    def stop(self):
+        self._stop.set()
+
+
+def main():
+    import argparse
+    p = argparse.ArgumentParser(description='IBM i Journal Receiver')
+    p.add_argument('--port',   type=int, default=LISTEN_PORT)
+    p.add_argument('--db',     default='ibmi_replica.db')
+    args = p.parse_args()
+
+    applier = JournalApplier(args.db)
+    log.info("Checkpoint at seq: %d", applier.get_checkpoint())
+
+    server = ReceiverServer(args.port, applier)
+
+    def shutdown(sig, frame):
+        log.info("Shutting down...")
+        server.stop()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT,  shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+
+    server.run()
+
+if __name__ == '__main__':
+    main()
