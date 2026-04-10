@@ -1,0 +1,45 @@
+/* STRJRNREP.CLLE — Start journaling on objects and kick off reader */
+PGM PARM(&TGTIP &TGTPORT)
+
+DCL VAR(&TGTIP)   TYPE(*CHAR) LEN(15)
+DCL VAR(&TGTPORT) TYPE(*CHAR) LEN(5)
+DCL VAR(&MSGID)   TYPE(*CHAR) LEN(7)
+DCL VAR(&MSGDTA)  TYPE(*CHAR) LEN(100)
+
+/* Create journal receiver if it doesn't exist */
+MONMSG MSGID(CPF0000)
+CRTJRNRCV JRNRCV(REPLLIB/REPLRCV0001) +
+           THRESHOLD(100000) +       /* 100MB before auto-switch */
+           TEXT('Replication receiver')
+
+/* Create journal */
+MONMSG MSGID(CPF0000)
+CRTJRN JRN(REPLLIB/REPLJRN) +
+        JRNRCV(REPLLIB/REPLRCV0001) +
+        MNGRCV(*SYSTEM) +            /* System manages receiver switching */
+        DLTRCV(*YES) +               /* Auto-delete detached receivers */
+        TEXT('Replication journal')
+
+/* Start journaling on your database files */
+/* Repeat for each file you want to replicate */
+STRJRNPF FILE(MYLIB/MYFILE) +
+           JRN(REPLLIB/REPLJRN) +
+           IMAGES(*BOTH) +           /* CRITICAL: capture before AND after */
+           OMTJRNE(*OPNCLO)          /* Skip open/close noise */
+
+/* Start journaling on IFS directories if needed */
+STRJRN OBJ('/mydata') +
+        JRN(REPLLIB/REPLJRN) +
+        SUBTREE(*ALL)
+
+/* Launch the reader program */
+SBMJOB CMD(CALL PGM(REPLLIB/JRNREAD) +
+            PARM(&TGTIP &TGTPORT +
+                 'REPLLIB' 'REPLJRN')) +
+        JOBD(REPLLIB/REPLJOBD) +
+        JOBQ(REPLLIB/REPLJOBQ) +
+        CPYENVVAR(*YES)
+
+SNDPGMMSG MSG('Journal replication started') TOPGMQ(*EXT)
+
+ENDPGM
