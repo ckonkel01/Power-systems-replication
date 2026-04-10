@@ -1,0 +1,80 @@
+#!/bin/bash
+# mount_aix_image.sh
+# Mounts a replicated AIX JFS2 disk image on Linux
+# Requires: kpartx, jfsutils (apt install jfsutils)
+# Usage: ./mount_aix_image.sh <image_or_device> <mountpoint>
+
+set -euo pipefail
+
+IMAGE="${1:-}"
+MNTPT="${2:-/mnt/aix_disk}"
+LOOPDEV=""
+
+cleanup() {
+    echo "Cleaning up..."
+    [[ -n "$LOOPDEV" ]] && kpartx -d "$LOOPDEV" 2>/dev/null || true
+    losetup -d "$LOOPDEV" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+if [[ -z "$IMAGE" || -z "$MNTPT" ]]; then
+    echo "Usage: $0 <image_file_or_block_dev> <mountpoint>"
+    exit 1
+fi
+
+[[ $EUID -ne 0 ]] && { echo "Must run as root"; exit 1; }
+mkdir -p "$MNTPT"
+
+# If it's a file, set up a loop device
+if [[ -f "$IMAGE" ]]; then
+    LOOPDEV=$(losetup --find --show "$IMAGE")
+    echo "Loop device: $LOOPDEV"
+else
+    LOOPDEV="$IMAGE"
+fi
+
+# Show partition table (AIX uses DOS MBR or GPT)
+echo "=== Partition table ==="
+fdisk -l "$LOOPDEV" 2>/dev/null || parted "$LOOPDEV" print 2>/dev/null || true
+
+# Map partitions
+kpartx -av "$LOOPDEV"
+sleep 1
+
+# List mapped devices
+PARTS=$(ls /dev/mapper/$(basename "$LOOPDEV")p* 2>/dev/null || \
+        ls /dev/mapper/loop*p* 2>/dev/null || true)
+
+if [[ -z "$PARTS" ]]; then
+    echo "No partitions found. Trying direct mount..."
+    PARTS="$LOOPDEV"
+fi
+
+echo "=== Available partitions ==="
+echo "$PARTS"
+
+# Attempt JFS2 mount on each partition
+for PART in $PARTS; do
+    echo "Trying JFS2 mount: $PART"
+    if mount -t jfs2 -o ro,nointegrity "$PART" "$MNTPT" 2>/dev/null; then
+        echo "SUCCESS: $PART mounted at $MNTPT"
+        echo ""
+        echo "Contents:"
+        ls -la "$MNTPT" | head -20
+        echo ""
+        echo "Unmount with: umount $MNTPT"
+        trap - EXIT  # Don't auto-cleanup if mount succeeded
+        exit 0
+    fi
+done
+
+echo ""
+echo "JFS2 mount failed. This is likely due to:"
+echo "  1. POWER/x86 endianness difference in LVM metadata"
+echo "  2. AIX LVM headers not recognized by Linux"
+echo "  3. Filesystem not JFS2 (check: file -s $LOOPDEV)"
+echo ""
+echo "Alternatives:"
+echo "  - Use AIX SAVEVG/RESTVG for volume group portability"
+echo "  - Extract with pax/tar before replication"
+echo "  - Use NFS/GPFS shared storage instead"
